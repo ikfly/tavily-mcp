@@ -12,10 +12,27 @@ import { hideBin } from 'yargs/helpers';
 
 dotenv.config();
 
-const API_KEY = process.env.TAVILY_API_KEY;
-const IS_KEYLESS = !API_KEY;
+const RAW_KEYS = (process.env.TAVILY_API_KEY ?? '').split(',').map((k: string) => k.trim()).filter(Boolean) as string[];
+const API_KEYS: string[] = [...new Set(RAW_KEYS)];
+const IS_KEYLESS = API_KEYS.length === 0;
+const IS_MULTI_KEY = API_KEYS.length > 1;
 const HUMAN_ID = process.env.TAVILY_HUMAN_ID;
 const SESSION_ID = randomUUID();
+
+// --- Multi-key failover state ---
+let nextRoundRobinIndex = 0;
+
+interface KeyHealth {
+  consecutiveFailures: number;
+  bannedUntil: number; // epoch ms, 0 = not banned
+}
+const keyHealthMap: Record<number, KeyHealth> = {};
+for (let i = 0; i < API_KEYS.length; i++) {
+  keyHealthMap[i] = { consecutiveFailures: 0, bannedUntil: 0 };
+}
+
+const BAN_THRESHOLD = 2;
+const BAN_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 1 month
 
 
 interface TavilyResponse {
@@ -100,7 +117,7 @@ class TavilyClient {
         'content-type': 'application/json',
         ...(IS_KEYLESS
           ? { 'X-Tavily-Access-Mode': 'keyless', 'X-Client-Source': 'tavily-mcp-keyless' }
-          : { 'Authorization': `Bearer ${API_KEY}`, 'X-Client-Source': 'MCP' }),
+          : { 'Authorization': `Bearer ${getCurrentKey()}`, 'X-Client-Source': 'MCP' }),
         'X-Session-Id': SESSION_ID,
         ...(HUMAN_ID ? { 'X-Human-Id': HUMAN_ID } : {}),
       }
@@ -108,6 +125,8 @@ class TavilyClient {
 
     if (IS_KEYLESS) {
       console.error('[tavily-mcp] no TAVILY_API_KEY set; running in keyless mode. Search and extract are available; other tools will return a message explaining that an API key is required.');
+    } else if (IS_MULTI_KEY) {
+      console.error(`[tavily-mcp] multi-key failover active: ${API_KEYS.length} keys configured`);
     }
 
     this.setupHandlers();
@@ -587,6 +606,55 @@ class TavilyClient {
     console.error("Tavily MCP server running on stdio");
   }
 
+  /** Update the Bearer token in axios headers (used on key rotation). */
+  private updateApiKey(key: string): void {
+    (this.axiosInstance.defaults.headers.common as Record<string, string>)['Authorization'] = `Bearer ${key}`;
+  }
+
+  /**
+   * Execute an async operation with automatic key rotation on 401/429.
+   * On success: resets the key's failure counter.
+   * On 401/429: records failure, may ban the key, retries once with next key.
+   */
+  private async executeWithFailover<T>(
+    operation: (keyIndex: number) => Promise<T>
+  ): Promise<T> {
+    // Single key or keyless: bypass failover, use index 0 or -1
+    if (!IS_MULTI_KEY) {
+      return operation(IS_KEYLESS ? -1 : 0);
+    }
+
+    const currentIdx = selectNextKey();
+    if (currentIdx < 0) {
+      return operation(0);
+    }
+
+    try {
+      const result = await operation(currentIdx);
+      resetKeySuccess(currentIdx);
+      return result;
+    } catch (error: any) {
+      const status = error?.response?.status ?? error?.status;
+
+      if (status === 429 || status === 401) {
+        recordKeyFailure(currentIdx);
+        const retryIdx = selectNextKey();
+        if (retryIdx !== currentIdx) {
+          this.updateApiKey(API_KEYS[retryIdx]);
+          try {
+            const result = await operation(retryIdx);
+            resetKeySuccess(retryIdx);
+            return result;
+          } catch (retryError: any) {
+            this.updateApiKey(API_KEYS[currentIdx]);
+            throw retryError;
+          }
+        }
+      }
+      throw error;
+    }
+  }
+
   async search(params: any): Promise<TavilyResponse> {
       const endpoint = this.baseURLs.search;
 
@@ -609,7 +677,7 @@ class TavilyClient {
         start_date: params.start_date,
         end_date: params.end_date,
         exact_match: params.exact_match,
-        ...(IS_KEYLESS ? {} : { api_key: API_KEY }),
+        ...(IS_KEYLESS ? {} : { api_key: getCurrentKey() }),
       };
       
       // Apply default parameters
@@ -637,31 +705,39 @@ class TavilyClient {
         }
       }
       
-      const response = await this.axiosInstance.post(endpoint, cleanedParams);
+      const response = await this.executeWithFailover(async (keyIdx) =>
+        this.axiosInstance.post(endpoint, cleanedParams)
+      );
       return response.data;
   }
 
   async extract(params: any): Promise<TavilyResponse> {
-    const response = await this.axiosInstance.post(this.baseURLs.extract, {
-      ...params,
-      ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-    });
+    const response = await this.executeWithFailover(async () =>
+      this.axiosInstance.post(this.baseURLs.extract, {
+        ...params,
+        ...(IS_KEYLESS ? {} : { api_key: getCurrentKey() })
+      })
+    );
     return response.data;
   }
 
   async crawl(params: any): Promise<TavilyCrawlResponse> {
-    const response = await this.axiosInstance.post(this.baseURLs.crawl, {
-      ...params,
-      ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-    });
+    const response = await this.executeWithFailover(async () =>
+      this.axiosInstance.post(this.baseURLs.crawl, {
+        ...params,
+        ...(IS_KEYLESS ? {} : { api_key: getCurrentKey() })
+      })
+    );
     return response.data;
   }
 
   async map(params: any): Promise<TavilyMapResponse> {
-    const response = await this.axiosInstance.post(this.baseURLs.map, {
-      ...params,
-      ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-    });
+    const response = await this.executeWithFailover(async () =>
+      this.axiosInstance.post(this.baseURLs.map, {
+        ...params,
+        ...(IS_KEYLESS ? {} : { api_key: getCurrentKey() })
+      })
+    );
     return response.data;
   }
 
@@ -673,11 +749,13 @@ class TavilyClient {
     const MAX_MINI_MODEL_POLL_DURATION = 300000; // 5 minutes in ms
 
     try {
-      const response = await this.axiosInstance.post(this.baseURLs.research, {
-        input: params.input,
-        model: params.model || 'auto',
-        ...(IS_KEYLESS ? {} : { api_key: API_KEY })
-      });
+      const response = await this.executeWithFailover(async () =>
+        this.axiosInstance.post(this.baseURLs.research, {
+          input: params.input,
+          model: params.model || 'auto',
+          ...(IS_KEYLESS ? {} : { api_key: getCurrentKey() })
+        })
+      );
 
       const requestId = response.data.request_id;
       if (!requestId) {
@@ -697,8 +775,8 @@ class TavilyClient {
         totalElapsed += pollInterval;
 
         try {
-          const pollResponse = await this.axiosInstance.get(
-            `${this.baseURLs.research}/${requestId}`
+          const pollResponse = await this.executeWithFailover(async () =>
+            this.axiosInstance.get(`${this.baseURLs.research}/${requestId}`)
           );
 
           const status = pollResponse.data.status;
@@ -734,6 +812,69 @@ class TavilyClient {
       throw error;
     }
   }
+}
+
+// --- Multi-key failover helpers ---
+
+/** Select the next available key (round-robin + health check). Skips banned keys. */
+function selectNextKey(): number {
+  if (IS_KEYLESS || API_KEYS.length <= 1) return -1;
+
+  // Clean up expired bans
+  const now = Date.now();
+  for (const idx in keyHealthMap) {
+    const h = keyHealthMap[Number(idx)];
+    if (h.bannedUntil > 0 && now >= h.bannedUntil) {
+      h.bannedUntil = 0;
+      h.consecutiveFailures = 0;
+      console.error(`[tavily-mcp] Key ${idx} unbanned, re-added to rotation`);
+    }
+  }
+
+  // Round-robin to next healthy key
+  for (let i = 0; i < API_KEYS.length; i++) {
+    const idx = (nextRoundRobinIndex + i) % API_KEYS.length;
+    if (keyHealthMap[idx].bannedUntil === 0) {
+      nextRoundRobinIndex = (idx + 1) % API_KEYS.length;
+      return idx;
+    }
+  }
+
+  // All banned — fall back to key 0
+  console.error('[tavily-mcp] WARNING: all keys banned, falling back to key 0');
+  return 0;
+}
+
+/** Record a failure for a key; ban it if consecutive failures reach threshold. */
+function recordKeyFailure(keyIndex: number): void {
+  if (!IS_MULTI_KEY) return;
+  const health = keyHealthMap[keyIndex];
+  health.consecutiveFailures++;
+  console.error(`[tavily-mcp] Key ${keyIndex} consecutive failures: ${health.consecutiveFailures}/${BAN_THRESHOLD}`);
+
+  if (health.consecutiveFailures >= BAN_THRESHOLD) {
+    health.bannedUntil = Date.now() + BAN_DURATION_MS;
+    const days = BAN_DURATION_MS / (1000 * 60 * 60 * 24);
+    console.error(`[tavily-mcp] Key ${keyIndex} BANNED for ${days} days`);
+  }
+}
+
+/** Reset consecutive failure count on success. */
+function resetKeySuccess(keyIndex: number): void {
+  if (!IS_MULTI_KEY) return;
+  keyHealthMap[keyIndex].consecutiveFailures = 0;
+}
+
+/** Get the current active key string. */
+function getCurrentKey(): string | undefined {
+  if (IS_KEYLESS || API_KEYS.length === 0) return undefined;
+  // Multi-key: use round-robin selection
+  if (IS_MULTI_KEY) {
+    const idx = selectNextKey();
+    return idx >= 0 ? API_KEYS[idx] : API_KEYS[0];
+  }
+  // Single key: always return it
+  return API_KEYS[0];
 }
 
 function isKeylessEnvelope(data: any): boolean {

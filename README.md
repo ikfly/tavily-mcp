@@ -190,6 +190,24 @@ You can set default parameter values for the `tavily-search` tool using the `DEF
 export DEFAULT_PARAMETERS='{"include_images": true}'
 ```
 
+## TAVILY_API_KEY Configuration
+
+### Single Key (default behavior)
+
+```bash
+export TAVILY_API_KEY="sk-your-api-key"
+```
+
+### Multiple Keys (Round-Robin Load Balancing + Failover)
+
+```bash
+export TAVILY_API_KEY="sk-key1,sk-key2,sk-key3"
+```
+
+When multiple keys are provided, the server uses round-robin to distribute requests across keys. If a key returns 429 (rate limited) or 401 (invalid) twice consecutively, it is temporarily banned for 1 month and removed from rotation. Requests automatically use the remaining healthy keys. Banned keys are re-enabled after 1 month.
+
+Duplicates and whitespace are handled automatically: `" sk1 , sk1 , sk2 "` becomes `["sk1", "sk2"]`.
+
 ### Example usage from Client
 ```json
 {
