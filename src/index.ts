@@ -32,7 +32,13 @@ for (let i = 0; i < API_KEYS.length; i++) {
 }
 
 const BAN_THRESHOLD = 2;
-const BAN_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 1 month
+
+/** Ban a key until the 1st of the next month (epoch ms). */
+function banUntilNextMonth(): number {
+  const now = new Date();
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  return nextMonth.getTime();
+}
 
 
 interface TavilyResponse {
@@ -853,9 +859,9 @@ function recordKeyFailure(keyIndex: number): void {
   console.error(`[tavily-mcp] Key ${keyIndex} consecutive failures: ${health.consecutiveFailures}/${BAN_THRESHOLD}`);
 
   if (health.consecutiveFailures >= BAN_THRESHOLD) {
-    health.bannedUntil = Date.now() + BAN_DURATION_MS;
-    const days = BAN_DURATION_MS / (1000 * 60 * 60 * 24);
-    console.error(`[tavily-mcp] Key ${keyIndex} BANNED for ${days} days`);
+    health.bannedUntil = banUntilNextMonth();
+    const banDate = new Date(health.bannedUntil).toLocaleDateString();
+    console.error(`[tavily-mcp] Key ${keyIndex} BANNED until ${banDate}`);
   }
 }
 

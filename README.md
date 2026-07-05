@@ -207,7 +207,7 @@ export TAVILY_API_KEY="sk-your-api-key"
 export TAVILY_API_KEY="sk-key1,sk-key2,sk-key3"
 ```
 
-When multiple keys are provided, the server uses round-robin to distribute requests across keys. If a key returns 429 (rate limited) or 401 (invalid) twice consecutively, it is temporarily banned for 1 month and removed from rotation. Requests automatically use the remaining healthy keys. Banned keys are re-enabled after 1 month.
+When multiple keys are provided, the server uses round-robin to distribute requests across keys. If a key returns 429 (rate limited) or 401 (invalid) twice consecutively, it is temporarily banned and removed from rotation until the 1st of the next month. Requests automatically use the remaining healthy keys. Banned keys are re-enabled on the 1st of the following month.
 
 Duplicates and whitespace are handled automatically: `" sk1 , sk1 , sk2 "` becomes `["sk1", "sk2"]`.
 
